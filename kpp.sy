@@ -1,0 +1,247 @@
+
+# Streamlit dashboard for HR attrition & insurance insights
+# NOTE: File named kpp.sy per request. If Streamlit Cloud expects .py, rename to kpp.py on GitHub or set the "main file" accordingly.
+import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
+from utils import load_and_clean, preprocess_for_model, train_models_and_report, predict_and_attach
+import matplotlib.pyplot as plt
+from sklearn.exceptions import NotFittedError
+
+st.set_page_config(layout="wide", page_title="HR Attrition & Insurance Dashboard")
+
+st.title("HR Attrition & Insurance Dashboard")
+
+# Load default dataset (if available)
+DEFAULT_PATH = "Insurance.csv"
+
+@st.cache_data
+def get_default_df():
+    try:
+        df = pd.read_csv(DEFAULT_PATH)
+        return df
+    except Exception as e:
+        return None
+
+df_default = get_default_df()
+
+# Sidebar - global filters
+st.sidebar.header("Global filters (apply to charts)")
+job_roles = []
+satisfaction_col = None
+if df_default is not None:
+    # detect job role-like columns
+    possible_role_cols = [c for c in df_default.columns if "role" in c.lower() or "job" in c.lower()]
+    if possible_role_cols:
+        job_roles = possible_role_cols[0]
+    else:
+        # fallback to 'JobRole' or first categorical
+        if "JobRole" in df_default.columns:
+            job_roles = "JobRole"
+        else:
+            cats = df_default.select_dtypes(include=['object','category']).columns.tolist()
+            job_roles = cats[0] if cats else None
+    # detect satisfaction column
+    sat_candidates = [c for c in df_default.columns if 'satisf' in c.lower() or 'satisfaction' in c.lower()]
+    satisfaction_col = sat_candidates[0] if sat_candidates else None
+
+if job_roles:
+    roles = ["All"] + sorted(df_default[job_roles].dropna().unique().tolist()) if df_default is not None else ["All"]
+    selected_roles = st.sidebar.multiselect("Filter by job role (multiselect):", options=roles, default=["All"])
+else:
+    selected_roles = ["All"]
+
+if satisfaction_col:
+    min_s = float(df_default[satisfaction_col].min()) if df_default is not None else 0.0
+    max_s = float(df_default[satisfaction_col].max()) if df_default is not None else 1.0
+    sat_range = st.sidebar.slider(f"Satisfaction ({satisfaction_col}) range:", min_value=min_s, max_value=max_s, value=(min_s, max_s))
+else:
+    sat_range = None
+
+st.markdown("---")
+
+# Tabs for visualizations, modeling and prediction
+tab1, tab2, tab3 = st.tabs(["Dashboard (Charts)", "Modeling (Train & Metrics)", "Upload & Predict"])
+
+# Utility to get filtered dataframe
+def apply_filters(df):
+    if df is None:
+        return None
+    d = df.copy()
+    if job_roles and selected_roles and "All" not in selected_roles:
+        d = d[d[job_roles].isin(selected_roles)]
+    if satisfaction_col and sat_range is not None:
+        d = d[(d[satisfaction_col] >= sat_range[0]) & (d[satisfaction_col] <= sat_range[1])]
+    return d
+
+with tab1:
+    st.header("Interactive Charts & HR Insights")
+    st.write("Use the sidebar to filter charts by job role and satisfaction (if detected).")
+    df = apply_filters(df_default)
+    if df is None:
+        st.warning("No default dataset found. Upload a dataset in the 'Upload & Predict' tab or place Insurance.csv in the app root.")
+    else:
+        # Chart 1: Attrition count by Job Role (bar)
+        st.subheader("1) Attrition count by Job Role")
+        if job_roles:
+            attr_col = None
+            # try find attrition-like column
+            potential = [c for c in df.columns if 'attrit' in c.lower() or c.lower()=='attrition']
+            attr_col = potential[0] if potential else None
+            if not attr_col:
+                st.info("No 'Attrition' column detected. Counting 'label' or 'target' if present.")
+                for alt in ['label','target','Attrition','LEAVES']:
+                    if alt in df.columns:
+                        attr_col = alt; break
+            if attr_col:
+                counts = df.groupby([job_roles, attr_col]).size().unstack(fill_value=0)
+                st.dataframe(counts)
+                fig, ax = plt.subplots(figsize=(8,4))
+                counts.plot(kind='bar', stacked=True, ax=ax)
+                ax.set_ylabel("Count")
+                ax.set_title("Attrition by Job Role")
+                st.pyplot(fig)
+            else:
+                st.info("No attrition-like column found to produce this chart.")
+        else:
+            st.info("No job-role-like column detected in dataset to create this chart.")
+
+        # Chart 2: Satisfaction vs Attrition scatter (complex insight)
+        st.subheader("2) Satisfaction vs Attrition (scatter with mean lines)")
+        if satisfaction_col and attr_col:
+            fig, ax = plt.subplots(figsize=(8,4))
+            # jitter for better visibility
+            jitter = (np.random.random(len(df)) - 0.5) * 0.02 * (df[satisfaction_col].max() - df[satisfaction_col].min())
+            ax.scatter(df[satisfaction_col] + jitter, df.index, alpha=0.6, s=20)
+            ax.axvline(df[df[attr_col]==1][satisfaction_col].mean() if df[attr_col].dtype.kind in 'biufc' else 0, linestyle='--', label='Mean (Attrition==1)')
+            ax.axvline(df[df[attr_col]==0][satisfaction_col].mean() if df[attr_col].dtype.kind in 'biufc' else 0, linestyle=':', label='Mean (Attrition==0)')
+            ax.set_xlabel(satisfaction_col)
+            ax.set_ylabel("Employee index (for distribution)")
+            ax.set_title("Distribution of Satisfaction and attrition marker")
+            ax.legend()
+            st.pyplot(fig)
+            st.write("Insight: Compare the mean satisfaction of leavers vs stayers to guide targeted retention.")
+        else:
+            st.info("Satisfaction or Attrition column not found; cannot render this chart.")
+
+        # Chart 3: Age distribution with boxplot by attrition (histogram + boxplot)
+        st.subheader("3) Age distribution and boxplot by Attrition")
+        age_cols = [c for c in df.columns if 'age' in c.lower()]
+        if age_cols and attr_col:
+            age_col = age_cols[0]
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.hist(df[age_col].dropna(), bins=15)
+            ax.set_xlabel(age_col)
+            ax.set_ylabel("Count")
+            ax.set_title(f"Histogram of {age_col}")
+            st.pyplot(fig)
+            # boxplot by attrition
+            fig2, ax2 = plt.subplots(figsize=(8,4))
+            groups = [df[df[attr_col]==g][age_col].dropna() for g in sorted(df[attr_col].unique())]
+            ax2.boxplot(groups, labels=[str(g) for g in sorted(df[attr_col].unique())])
+            ax2.set_xlabel("Attrition")
+            ax2.set_ylabel(age_col)
+            ax2.set_title(f"{age_col} by Attrition")
+            st.pyplot(fig2)
+        else:
+            st.info("No age-like or attrition column detected for this chart.")
+
+        # Chart 4: Correlation heatmap for numeric columns (complex)
+        st.subheader("4) Correlation heatmap (numeric features)")
+        num_df = df.select_dtypes(include=[np.number])
+        if not num_df.empty:
+            corr = num_df.corr()
+            fig, ax = plt.subplots(figsize=(8,6))
+            cax = ax.matshow(corr)
+            fig.colorbar(cax)
+            ax.set_xticks(range(len(corr.columns)))
+            ax.set_yticks(range(len(corr.columns)))
+            ax.set_xticklabels(corr.columns, rotation=90)
+            ax.set_yticklabels(corr.columns)
+            ax.set_title("Correlation matrix (numeric features)")
+            st.pyplot(fig)
+            st.write("Insight: Strong correlations suggest which features might be redundant or predictive of attrition.")
+        else:
+            st.info("No numeric columns detected to compute correlation.")
+
+        # Chart 5: Custom KPI panel (composed metrics)
+        st.subheader("5) KPI Panel: Attrition rate, Avg satisfaction, Avg income (by Job Role)")
+        metric_cols = {}
+        sat_col = satisfaction_col if satisfaction_col else None
+        income_cols = [c for c in df.columns if 'income' in c.lower() or 'salary' in c.lower()]
+        income_col = income_cols[0] if income_cols else None
+        if job_roles and attr_col:
+            kpi = df.groupby(job_roles).agg(
+                total=('index','count') if False else (attr_col,'count'),
+            )
+            # compute attrition rate
+            grp = df.groupby(job_roles)
+            attr_rate = grp[attr_col].apply(lambda x: (x==1).sum()/len(x) if len(x)>0 else 0).rename("attrition_rate")
+            avg_sat = grp[sat_col].mean().rename("avg_satisfaction") if sat_col else None
+            avg_inc = grp[income_col].mean().rename("avg_income") if income_col else None
+            kpi = pd.concat([attr_rate, avg_sat, avg_inc], axis=1)
+            st.dataframe(kpi.sort_values(by='attrition_rate', ascending=False).fillna("-"))
+            st.write("Actionable: Focus retention programs on roles with high attrition_rate and low avg_satisfaction. Consider insurance policy changes for roles with higher avg_income and higher attrition.")
+        else:
+            st.info("Not enough columns to compute KPI panel.")
+
+with tab2:
+    st.header("Modeling: Train three algorithms and view metrics")
+    st.write("This tab will train Decision Tree, Random Forest and Gradient Boosted classifiers on the dataset and show performance metrics.")
+    model_df = apply_filters(df_default)
+    if model_df is None:
+        st.warning("No dataset available for modeling. Upload or place Insurance.csv in app root.")
+    else:
+        # Preprocess and train when button pressed
+        if st.button("Train all models and show metrics"):
+            with st.spinner("Preprocessing and training models..."):
+                X, y, preprocess_info = preprocess_for_model(model_df)
+                results = train_models_and_report(X, y)
+                # display results
+                for name, res in results.items():
+                    st.subheader(name)
+                    st.write("Accuracy: {:.3f}".format(res['accuracy']))
+                    st.write("Precision: {:.3f}".format(res['precision']))
+                    st.write("Recall: {:.3f}".format(res['recall']))
+                    st.write("F1-score: {:.3f}".format(res['f1']))
+                    st.write("Confusion matrix:")
+                    st.write(res['confusion_matrix'].tolist())
+        else:
+            st.info("Click the button to train models on the filtered dataset.")
+
+with tab3:
+    st.header("Upload new dataset and predict Attrition")
+    st.write("Upload a CSV and the app will clean it, predict attrition using models trained on the default dataset, and allow download of predictions.")
+    uploaded = st.file_uploader("Upload CSV dataset for prediction", type=["csv"])
+    if uploaded is None and df_default is None:
+        st.info("No default dataset available and no file uploaded. Please upload a training dataset or place Insurance.csv in the app root.")
+    else:
+        # Train models on default dataset so we have a model ready (if possible)
+        trained_models = None
+        try:
+            if df_default is not None:
+                X_train_ready, y_train_ready, preprocess_info = preprocess_for_model(df_default)
+                trained_models = train_models_and_report(X_train_ready, y_train_ready, return_models=True)
+        except Exception as e:
+            st.warning(f"Could not train models on default dataset automatically: {e}")
+
+        if uploaded is not None:
+            new_df = pd.read_csv(uploaded)
+            # If models not trained, attempt to train using default if available
+            if trained_models is None:
+                st.warning("Models are not trained because no default dataset existed. Upload a training dataset first.")
+            else:
+                try:
+                    labeled = predict_and_attach(new_df, trained_models['RandomForest'])  # use RF for predictions
+                    st.dataframe(labeled.head(20))
+                    # allow download
+                    csv = labeled.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download predicted CSV", data=csv, file_name="predicted_with_attrition.csv", mime="text/csv")
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
+
+st.markdown("---")
+st.write("Notes:")
+st.write("- The app attempts to auto-detect Attrition, Job Role, Satisfaction and Income-like columns. If your dataset uses different names, consider renaming columns to standard names (e.g., 'Attrition', 'JobRole', 'Satisfaction', 'Income').")
+st.write("- Main app file is named `kpp.sy`. If Streamlit Cloud requires `.py`, rename accordingly.")
